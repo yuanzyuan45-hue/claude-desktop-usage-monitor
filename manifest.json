@@ -1,0 +1,27 @@
+{
+  "manifest_version": "0.3",
+  "name": "claude-usage-monitor",
+  "display_name": "Claude 用量监控",
+  "version": "1.1.0",
+  "description": "从 Claude 桌面版本地缓存读取会话(5小时)/每周(7天)用量百分比与重置时间,免费账户可用,纯本地读取不联网。",
+  "author": {
+    "name": "local user"
+  },
+  "server": {
+    "type": "python",
+    "entry_point": "main.py",
+    "mcp_config": {
+      "command": "python",
+      "args": [
+        "${__dirname}/main.py"
+      ]
+    }
+  },
+  "tools": [
+    {
+      "name": "claude_usage",
+      "description": "读取本机 Claude 桌面版缓存的用量:会话(5小时)与每周(7天)已用百分比、重置时间"
+    }
+  ],
+  "license": "MIT"
+}
