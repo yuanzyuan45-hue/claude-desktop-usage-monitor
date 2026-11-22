@@ -1,0 +1,12 @@
+# 运行时产物(自动生成,不入库)
+state.json
+state.json.tmp
+error.log
+__pycache__/
+*.pyc
+
+# 打包产物由 README 的 zip 命令生成,但仍保留在仓库里供直接下载
+# claude-usage-monitor.mcpb
+
+# 本地备份
+_backup_orig/
