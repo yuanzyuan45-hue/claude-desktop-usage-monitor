@@ -25,7 +25,7 @@
 
 ### 步骤
 
-1. 下载 **`claude-usage-monitor.mcpb`**(仓库根目录里就有;若已发布 Release,也可从 Release 下载)
+1. 下载 **`claude-usage-monitor.mcpb`** —— 推荐从 [Releases · v1.2.1](https://github.com/yuanzyuan45-hue/claude-desktop-usage-monitor/releases/download/v1.2.1/claude-usage-monitor.mcpb) 直接下载;仓库根目录里也有一份同内容副本
 2. 打开 Claude 桌面端 → **设置 → 桌面应用 → 扩展 → 管理**
 3. 点击 **高级设置**,拉到底部"扩展开发者"
 4. 点击 **安装扩展**,选择下载的 `.mcpb` 文件,确认安装
