@@ -1,10 +1,10 @@
 {
   "manifest_version": "0.3",
   "name": "claude-usage-monitor",
-  "display_name": "Claude 用量监控",
-  "version": "1.2.1",
-  "description": "从 Claude 桌面版本地缓存读取会话(5小时)/每周(7天)用量百分比与重置时间,免费账户可用,纯本地读取不联网。",
-  "long_description": "非官方 Claude Desktop 扩展。官方界面不给免费用户显示额度,本扩展补上这块:托盘图标悬停即看 5 小时 / 每周用量与重置时间,或在对话中让 Claude 调用 claude_usage 工具。只读取 Claude 桌面版自己写在 %APPDATA%\\Claude\\IndexedDB 下的本地缓存,不联网、不需要 API Key、不碰聊天内容。",
+  "display_name": "Claude Usage Monitor",
+  "version": "1.2.2",
+  "description": "See your Claude usage on the Free plan: 5-hour and 7-day percentages with reset times, read from the desktop app’s own local cache. No network, no API key.",
+  "long_description": "Unofficial Claude Desktop extension (MCPB). The Claude desktop app shows no usage percentage on the Free plan; this fills that gap: hover the tray icon for your 5-hour / weekly usage and reset times, or ask Claude to call the claude_usage tool in a conversation. It reads only the local cache the desktop app writes under %APPDATA%\\Claude\\IndexedDB — no network, no API key, no sessionKey, never touches your conversations.\n\n非官方 Claude Desktop 扩展。官方界面不给免费用户显示额度，本扩展补上这块：托盘图标悬停即看 5 小时 / 每周用量与重置时间，或在对话中让 Claude 调用 claude_usage 工具。只读取 Claude 桌面版自己写在 %APPDATA%\\Claude\\IndexedDB 下的本地缓存，不联网、不需要 API Key、不碰聊天内容。",
   "author": {
     "name": "yuanzyuan45-hue",
     "url": "https://github.com/yuanzyuan45-hue"
@@ -16,7 +16,17 @@
   "homepage": "https://github.com/yuanzyuan45-hue/claude-desktop-usage-monitor#readme",
   "support": "https://github.com/yuanzyuan45-hue/claude-desktop-usage-monitor/issues",
   "icon": "icon.png",
-  "keywords": ["claude", "usage", "quota", "limits", "tray", "mcp"],
+  "keywords": [
+    "claude",
+    "claude-desktop",
+    "usage",
+    "quota",
+    "limits",
+    "free-plan",
+    "indexeddb",
+    "tray",
+    "mcp"
+  ],
   "server": {
     "type": "python",
     "entry_point": "main.py",
@@ -28,7 +38,9 @@
     }
   },
   "compatibility": {
-    "platforms": ["win32"],
+    "platforms": [
+      "win32"
+    ],
     "runtimes": {
       "python": ">=3.7"
     }
@@ -36,7 +48,7 @@
   "tools": [
     {
       "name": "claude_usage",
-      "description": "读取本机 Claude 桌面版缓存的用量:会话(5小时)与每周(7天)已用百分比、重置时间"
+      "description": "Read the local Claude Desktop cache: 5-hour session and 7-day weekly usage percentage and reset times (会话 / 每周用量与重置时间)"
     }
   ],
   "license": "MIT"

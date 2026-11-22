@@ -539,6 +539,69 @@ class TestTrayFailureIsVisible(unittest.TestCase):
             self.assertIn('_diag(', window,
                           '第 %d 行提前返回前没有写日志:%s' % (i + 1, ln))
 
+class TestToolOutputIsBilingual(unittest.TestCase):
+    """工具输出、托盘提示、工具描述都要中英并存:英文用户装完不能只看懂中文。"""
+
+    def _rec(self):
+        return {'fetched_at': 1795338254605.0,
+                'session': {'util': 0.36, 'pct': 36, 'reset': time.time() + 3600},
+                'weekly': {'util': 0.05, 'pct': 5, 'reset': time.time() + 86400}}
+
+    def test_usage_text_carries_both_languages(self):
+        import main
+        saved = main.read_usage
+        main.read_usage = lambda: self._rec()
+        try:
+            text = main.usage_text()
+        finally:
+            main.read_usage = saved
+        self.assertIn('已用', text)
+        self.assertIn('used', text)
+        self.assertIn('Session (5h)', text)
+        self.assertIn('Week (7d)', text)
+        self.assertIn('36%', text)
+        self.assertIn('5%', text)
+
+    def test_usage_text_no_data_path_is_bilingual(self):
+        import main
+        saved = main.read_usage
+        main.read_usage = lambda: None
+        try:
+            text = main.usage_text()
+        finally:
+            main.read_usage = saved
+        self.assertIn('发送一条消息', text)
+        self.assertIn('Send a message', text)
+
+    def test_reset_branch_is_bilingual(self):
+        import main
+        past = time.time() - 60
+        saved = main.read_usage
+        main.read_usage = lambda: {
+            'fetched_at': 1795338254605.0,
+            'session': {'util': 0.36, 'pct': 36, 'reset': past},
+            'weekly': {'util': 0.05, 'pct': 5, 'reset': past}}
+        try:
+            text = main.usage_text()
+        finally:
+            main.read_usage = saved
+        self.assertIn('已于', text)
+        self.assertIn('window reset at', text)
+        self.assertIn('was 36%', text)
+
+    def test_tool_description_is_bilingual(self):
+        import main
+        desc = main.TOOLS[0]['description']
+        self.assertIn('用量', desc)
+        self.assertIn('Claude Desktop cache', desc)
+        self.assertIn('Free plan', desc)
+
+    def test_tray_tooltip_is_bilingual(self):
+        src = io.open(os.path.join(HERE, 'main.py'), encoding='utf-8').read()
+        self.assertIn("parts.append('会话/Session ", src)
+        self.assertIn("parts.append('每周/Week ", src)
+        self.assertIn('Claude 用量 Usage', src)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

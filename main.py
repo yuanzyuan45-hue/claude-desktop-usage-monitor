@@ -21,7 +21,7 @@ import traceback
 HERE = os.path.dirname(os.path.abspath(__file__))
 NL = chr(10)   # 日志里的换行;不写 '\n' 以免被某些编辑器改回 CRLF
 STATE_FILE = os.path.join(HERE, 'state.json')
-VERSION = '1.2.1'   # 与 manifest.json 的 version 必须一致,test_main.py 会校验
+VERSION = '1.2.2'   # 与 manifest.json 的 version 必须一致,test_main.py 会校验
 
 # ── LevelDB / Snappy(纯标准库)─────────────────────────────────────────────
 def snappy_decompress(src):
@@ -696,21 +696,21 @@ def _tray_thread(poller):
             icon_pct = 0
             if s:
                 if s['reset'] <= now:
-                    parts.append('会话已于%s重置' % fmt_ts(s['reset']))
+                    parts.append('会话/Session 已于%s重置·reset' % fmt_ts(s['reset']))
                 else:
-                    parts.append('会话 %s%%(重置 %s)' % (s['pct'], fmt_ts(s['reset'])))
+                    parts.append('会话/Session %s%%(%s)' % (s['pct'], fmt_ts(s['reset'])))
                     alert = s['pct']
                     icon_pct = s['pct']
             if w:
                 if w['reset'] <= now:
-                    parts.append('每周已于%s重置' % fmt_ts(w['reset']))
+                    parts.append('每周/Week 已于%s重置·reset' % fmt_ts(w['reset']))
                 else:
-                    parts.append('每周 %s%%(重置 %s)' % (w['pct'], fmt_ts(w['reset'])))
+                    parts.append('每周/Week %s%%(%s)' % (w['pct'], fmt_ts(w['reset'])))
                     if alert is None:
                         alert = w['pct']
                         icon_pct = w['pct']
-            modify_tip('Claude 用量  ' + ' | '.join(parts) if parts
-                       else 'Claude 用量:等待数据…')
+            modify_tip('Claude 用量 Usage  ' + ' | '.join(parts) if parts
+                       else 'Claude 用量 Usage:等待数据 waiting…')
             # 图标数字变化时重绘
             if icon_pct != state['icon_pct']:
                 old = state['hicon']
@@ -727,7 +727,7 @@ def _tray_thread(poller):
                 step = int(alert // 5)
                 if step > state['notified']:
                     state['notified'] = step
-                    balloon('Claude 用量提醒', '会话(5小时)已用 %s%%' % alert)
+                    balloon('Claude 用量提醒 / Usage alert', '会话(5小时)已用 %s%% · Session (5h) at %s%%' % (alert, alert))
             elif alert is not None and alert < 50:
                 state['notified'] = 0
 
@@ -757,37 +757,48 @@ def _tray_thread(poller):
 # ── MCP stdio(JSON-RPC,换行分隔)──────────────────────────────────────────
 TOOLS = [{
     'name': 'claude_usage',
-    'description': ('读取本机 Claude 桌面版缓存的用量:会话(5小时)与每周(7天)'
-                    '已用百分比、重置时间。免费账户可用。无参数。'),
+    'description': ('读取本机 Claude 桌面版缓存的用量:会话(5小时)/每周(7天)已用百分比'
+                    '与重置时间,免费账户可用。Read the local Claude Desktop cache: '
+                    '5-hour session and 7-day weekly usage percentage and reset times '
+                    '(works on the Free plan). No parameters.'),
     'inputSchema': {'type': 'object', 'properties': {}, 'required': []},
 }]
 
 def usage_text():
     rec = read_usage()      # read_usage 内部已经 save_cached 过,这里不要再写一次
     if not rec:
-        return ('还没有读到用量数据。请在 Claude 桌面版里发送一条消息,'
-                '然后再次调用本工具。')
+        return ('还没有读到用量数据。请在 Claude 桌面版里发送一条消息,然后再次调用本工具。\n'
+                'No usage data yet. Send a message in the Claude desktop app, '
+                'then ask again.')
     now = time.time()
 
-    def win_line(name, w):
+    def win_line(name, en, w):
         if not w:
             return None
         if w['reset'] <= now:
             return ('%s:窗口已于 %s 重置,当前用量 0%%(发送任意一条消息后即可看到真实值;'
-                    '重置前为 %s%%)' % (name, fmt_ts(w['reset']), w['pct']))
-        return '%s:%s%% 已用,重置于 %s' % (name, w['pct'], fmt_ts(w['reset']))
+                    '重置前为 %s%%)\n'
+                    '%s: window reset at %s, 0%% used now (send any message to see '
+                    'the real value; was %s%% before reset)'
+                    % (name, fmt_ts(w['reset']), w['pct'],
+                       en, fmt_ts(w['reset']), w['pct']))
+        return ('%s:%s%% 已用,重置于 %s\n%s: %s%% used, resets %s'
+                % (name, w['pct'], fmt_ts(w['reset']),
+                   en, w['pct'], fmt_ts(w['reset'])))
 
     lines = []
-    for name, w in (('会话(5小时)', rec.get('session')),
-                    ('每周(7天)', rec.get('weekly'))):
-        line = win_line(name, w)
+    for name, en, w in (('会话(5小时)', 'Session (5h)', rec.get('session')),
+                        ('每周(7天)', 'Week (7d)', rec.get('weekly'))):
+        line = win_line(name, en, w)
         if line:
             lines.append(line)
     if not lines:
-        lines.append('本地缓存中暂时没有窗口用量数据。')
-    lines.append('(来自 Claude 桌面版本地缓存,随每条新消息自动更新)')
+        lines.append('本地缓存中暂时没有窗口用量数据。· No window usage in the local cache yet.')
+    lines.append('(来自 Claude 桌面版本地缓存,随每条新消息自动更新 · '
+                 'from the local Claude Desktop cache, updates with each new message)')
     if TRAY_STATE[0] == 'failed':
-        lines.append('(提示: 系统托盘组件未启动,详情见扩展目录下 error.log)')
+        lines.append('(提示: 系统托盘组件未启动,详情见扩展目录下 error.log · '
+                     'tray component not running, see error.log in the extension directory)')
     return '\n'.join(lines)
 
 _SCANNER = None
