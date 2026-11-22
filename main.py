@@ -9,9 +9,9 @@
 只读本地文件,不联网,不需要任何凭证。
 """
 import glob
+import io
 import json
 import os
-import queue
 import struct
 import sys
 import threading
@@ -19,7 +19,9 @@ import time
 import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+NL = chr(10)   # 日志里的换行;不写 '\n' 以免被某些编辑器改回 CRLF
 STATE_FILE = os.path.join(HERE, 'state.json')
+VERSION = '1.2.1'   # 与 manifest.json 的 version 必须一致,test_main.py 会校验
 
 # ── LevelDB / Snappy(纯标准库)─────────────────────────────────────────────
 def snappy_decompress(src):
@@ -145,11 +147,13 @@ def _block_entries(blk):
             shared, pos = read_varint(blk, pos)
             non_shared, pos = read_varint(blk, pos)
             vlen, pos = read_varint(blk, pos)
-            if pos + shared + non_shared + vlen > limit:
+            # LevelDB 的 shared 前缀字节并不存在块里,块内只有 non_shared
+            # 个 key 字节,所以读入量与偏移都只算 non_shared + vlen。
+            if pos + non_shared + vlen > limit:
                 break
-            key = key[:shared] + blk[pos+shared:pos+shared+non_shared]
-            val = blk[pos+shared+non_shared:pos+shared+non_shared+vlen]
-            pos += shared + non_shared + vlen
+            key = key[:shared] + blk[pos:pos+non_shared]
+            val = blk[pos+non_shared:pos+non_shared+vlen]
+            pos += non_shared + vlen
             out.append((key, val))
         except Exception:
             break
@@ -177,11 +181,11 @@ def ldb_values(path):
             shared, pos = read_varint(idx, pos)
             non_shared, pos = read_varint(idx, pos)
             vlen, pos = read_varint(idx, pos)
-            if pos + shared + non_shared + vlen > limit:
+            if pos + non_shared + vlen > limit:
                 break
-            key = key[:shared] + idx[pos+shared:pos+shared+non_shared]
-            val = idx[pos+shared+non_shared:pos+shared+non_shared+vlen]
-            pos += shared + non_shared + vlen
+            key = key[:shared] + idx[pos:pos+non_shared]
+            val = idx[pos+non_shared:pos+non_shared+vlen]
+            pos += non_shared + vlen
             if len(val) < 2:
                 continue
             b_off, j = read_varint(val, 0)
@@ -226,14 +230,70 @@ def _find_varint(d, pat, start, end):
     v, _ = read_varint(d, p + len(pat))
     return (v >> 1) ^ -(v & 1)
 
-def _pct(util, reset):
+# 解析失败必须留痕:否则 Claude 前端一改字段顺序,用户只会看到
+# "还没有读到用量数据",既分不清是缓存问题还是扩展坏了。
+_DIAG_LAST = [None]
+_DIAG_MAX = 256 * 1024
+_DIAG_BURST = 200          # 同类消息累计超过这个条数才补一行计数,别把日志刷爆
+_DIAG_SEEN = [0]
+_NO_ML = [0]        # 本轮扫描里"不是用量记录"的 value 数
+_NO_ML_LOGGED = [False]
+
+def _diag(msg):
+    """同一类消息只在"首次出现"和"每 _DIAG_BURST 次"时落盘。
+
+    每次 poll 都会遍历几百条与用量无关的 value,逐条写盘实测 6 秒能写出
+    130KB,error.log 会迅速滚到上限、把真正有用的那条挤掉。这里只保留
+    第一次的样本量和周期性的计数,信息量够定位问题。
+    """
+    try:
+        if _DIAG_LAST[0] == msg:
+            _DIAG_SEEN[0] += 1
+            if _DIAG_SEEN[0] % _DIAG_BURST:
+                return
+            msg = '%s(同类累计 %d 次)' % (msg, _DIAG_SEEN[0])
+        else:
+            _DIAG_LAST[0] = msg
+            _DIAG_SEEN[0] = 1
+        path = os.path.join(HERE, 'error.log')
+        try:
+            if os.path.getsize(path) > _DIAG_MAX:
+                with io.open(path, 'r+', encoding='utf-8', errors='replace') as f:
+                    tail = f.read()[-(_DIAG_MAX // 2):]
+                    f.seek(0)
+                    f.truncate()
+                    f.write('--- error.log 超过 256KB,已保留尾部 ---' + chr(10) + tail)
+        except OSError:
+            pass
+        with io.open(path, 'a', encoding='utf-8') as f:
+            f.write('%s %s' % (time.strftime('%Y-%m-%d %H:%M:%S'), msg) + chr(10))
+    except Exception:
+        pass
+
+def _brief(val, n=48):
+    if val is None:
+        return 'None'
+    return 'len=%d head=%s' % (len(val), val[:n].hex())
+
+_RESET_MIN = 1.577e9                       # 2020-01-01,再早的 resets_at 不可信
+_RESET_MAX_AHEAD = 400 * 86400             # 重置时间不可能比现在晚过一年
+
+def _pct(util, reset, name='?'):
+    """util(0..1) + reset(Unix 秒) -> {'util','pct','reset'}。
+
+    不做 99 上限:被限流的那一刻就该显示 100。舍入用 int(x+0.5),
+    因为 round() 是银行家舍入,0.045*100 == 4.5 会得到 4 而不是 5。
+    """
     if util is None or reset is None:
         return None
-    if not (0.0 <= util <= 1.0) or not (1.75e9 < reset < 1.9e9):
+    if not (0.0 <= util <= 1.0001):
+        _diag('%s: utilization 越界 %r' % (name, util))
         return None
-    return {'util': round(util, 4), 'pct': min(99, max(0, round(util * 100))),
-            'reset': reset}
-
+    if not (_RESET_MIN < reset < time.time() + _RESET_MAX_AHEAD):
+        _diag('%s: resets_at 越界 %r' % (name, reset))
+        return None
+    pct = max(0, min(100, int(util * 100 + 0.5)))
+    return {'util': round(util, 4), 'pct': pct, 'reset': reset}
 def extract_usage_record(val):
     d = val
     if b'messageLimits' not in d:
@@ -242,11 +302,20 @@ def extract_usage_record(val):
             if b'messageLimits' in d:
                 break
     if b'messageLimits' not in d:
+        # 这不是故障而是常态:同一个库里几百条 value,只有一条带用量。
+        # 逐条记会把 error.log 刷爆,真正的故障反而被挤掉。计数交给 poll()。
+        _NO_ML[0] += 1
         return None
     ml = d.find(P_ML)
     i5 = d.find(P_5H, ml)
     i7 = d.find(P_7D, ml)
-    if i5 == -1 or i7 == -1 or i7 < i5:
+    if i5 == -1 or i7 == -1:
+        _diag('找到 messageLimits 但缺窗口标记 i5=%d i7=%d ml 附近 %s'
+              % (i5, i7, _brief(d[ml:ml + 64]) if ml >= 0 else 'ml<0'))
+        return None
+    if i7 < i5:
+        _diag('窗口标记顺序变了(7d 在 5h 之前) i5=%d i7=%d,5h/7d 的顺序假设已失效'
+              % (i5, i7))
         return None
     org = None
     k = ml + len(P_ML)
@@ -261,9 +330,11 @@ def extract_usage_record(val):
     w_util = _find_dbl(d, P_UTIL, i7, i7 + 1500)
     w_reset = _find_dbl(d, P_RESET, i7, i7 + 1500)
     percent = _find_varint(d, P_PERCENT, i7, i7 + 6000)
-    session = _pct(s_util, s_reset)
-    weekly = _pct(w_util, w_reset)
+    session = _pct(s_util, s_reset, 'session')
+    weekly = _pct(w_util, w_reset, 'weekly')
     if session is None and weekly is None:
+        _diag('窗口标记都在但利用率/重置时间解析失败 s_util=%r s_reset=%r '
+              'w_util=%r w_reset=%r' % (s_util, s_reset, w_util, w_reset))
         return None
     return {'org': org, 'fetched_at': fetched, 'session': session,
             'weekly': weekly, 'percent': percent}
@@ -279,6 +350,19 @@ class UsageScanner:
         self.wal_state = {}        # path -> {'offset': int, 'buf': bytes}
         self.ldb_seen = {}         # path -> size
         self.last = None           # 最新记录
+
+    def _offer(self, rec):
+        """按 fetched_at 保留最新一条,而不是"最后解析到的一条"。
+
+        遍历顺序是文件顺序 + 块内顺序,跟时间无关:WAL 里的新记录排在
+        旧记录之后,而 .ldb 的块顺序也不保证时间递增。实测同一次 poll
+        里最后解析到的是 10%,真实最新是 12%。
+        """
+        if not rec:
+            return
+        cur = self.last
+        if cur is None or (rec.get('fetched_at') or 0) >= (cur.get('fetched_at') or 0):
+            self.last = rec
 
     def _scan_file(self, path):
         try:
@@ -305,9 +389,7 @@ class UsageScanner:
                 chunk, st['buf'] = st['buf'][:full], st['buf'][full:]
                 for rec in wal_records(chunk):
                     for v in batch_values(rec):
-                        rec2 = extract_usage_record(v)
-                        if rec2:
-                            self.last = rec2
+                        self._offer(extract_usage_record(v))
             self.wal_state[path] = st
         else:
             prev = self.ldb_seen.get(path)
@@ -316,9 +398,7 @@ class UsageScanner:
                 return
             try:
                 for v in ldb_values(path):
-                    rec2 = extract_usage_record(v)
-                    if rec2:
-                        self.last = rec2
+                    self._offer(extract_usage_record(v))
             except Exception:
                 pass
 
@@ -326,32 +406,72 @@ class UsageScanner:
         d = _watch_dir()
         if not os.path.isdir(d):
             return self.last
-        files = glob.glob(os.path.join(d, '*.log')) + glob.glob(os.path.join(d, '*.ldb'))
-        files.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
-                   reverse=True)
-        for f in files[:3]:
+        entries = []
+        for p in (glob.glob(os.path.join(d, '*.log')) +
+                  glob.glob(os.path.join(d, '*.ldb'))):
+            try:
+                entries.append((os.path.getmtime(p), p))
+            except OSError:
+                pass
+        entries.sort(reverse=True)
+        # WAL 全扫(通常 1-2 个);.ldb 取最新 8 个。原来一律只取 3 个,
+        # compaction 后最新记录可能落在第 4 个文件里就永远读不到了。
+        files = ([p for _, p in entries if p.endswith('.log')] +
+                 [p for _, p in entries if p.endswith('.ldb')][:8])
+        for f in files:
             self._scan_file(f)
         # 清理已消失文件的跟踪状态
-        alive = set(files[:3])
+        alive = set(files)
         for p in list(self.wal_state):
             if p not in alive:
                 self.wal_state.pop(p, None)
         for p in list(self.ldb_seen):
             if p not in alive:
                 self.ldb_seen.pop(p, None)
+        if self.last is None:
+            # 缓存里一条用量记录都没有:通常是从没在桌面端聊过天,属正常状态。
+            # 只提示一次,避免每 2 秒一轮把 error.log 写满。
+            if not _NO_ML_LOGGED[0]:
+                _NO_ML_LOGGED[0] = True
+                _diag('本地缓存里还没有 messageLimits 字段(已扫描 %d 个 value)。'
+                      '用法:在 Claude 桌面端发一条消息,让前端把限额状态写进缓存。'
+                      % _NO_ML[0])
+        else:
+            _NO_ML[0] = 0
+            _NO_ML_LOGGED[0] = False
         return self.last
 
 def load_cached():
     try:
-        return json.load(open(STATE_FILE, encoding='utf-8'))
+        with io.open(STATE_FILE, encoding='utf-8') as f:
+            return json.load(f)
     except Exception:
         return None
 
 def save_cached(rec):
+    """原子写:托盘线程和 MCP 主线程会同时调它,直接覆盖写会留下
+    半截 JSON 的窗口,读出来就是 None -> 又变成"还没读到用量数据"。"""
+    tmp = STATE_FILE + '.tmp'
     try:
-        json.dump(rec, open(STATE_FILE, 'w', encoding='utf-8'))
+        with io.open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(rec, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        # Windows 上 os.replace 会因为对方句柄没带 FILE_SHARE_DELETE 而抛
+        # PermissionError;并发写时重试几次即可,失败也只是少存一次。
+        for attempt in range(4):
+            try:
+                os.replace(tmp, STATE_FILE)
+                return
+            except OSError:
+                if attempt == 3:
+                    raise
+                time.sleep(0.02)
     except Exception:
-        pass
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 def fmt_ts(ts):
     try:
@@ -387,16 +507,64 @@ def make_icon(pct):
         return None
 
 # ── 系统托盘(ctypes,纯标准库)────────────────────────────────────────────
-TRAY_OK = False
+# 'starting' / 'ok' / 'failed' / 'stopped' — 托盘起不来时原来是完全静默的
+TRAY_STATE = ['starting']
+
+def _win32_prototypes(user32, shell32, kernel32, wintypes):
+    """声明 Win32 原型。
+
+    不声明 argtypes 时 ctypes 按 C int(32 位)传参,而 LPARAM 在 64 位
+    进程里是 8 字节:窗口过程收到 lParam 稍大的消息(WM_GETMINMAXINFO
+    之类)就抛 OverflowError: argument 4: int too long to convert。
+    异常发生在 ctypes 回调里会被吞掉,窗口过程返回无效值,托盘于是
+    静默失效。实测未声明时 error.log 里连堆栈都没有,只有 stderr 上的
+    "Exception ignored while calling ctypes callback function"。
+    """
+    import ctypes          # _tray_thread 里的 import 是局部名,这里要自己导一次
+    LRESULT = ctypes.c_ssize_t
+
+    user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                      wintypes.WPARAM, wintypes.LPARAM]
+    user32.DefWindowProcW.restype = LRESULT
+    user32.RegisterClassW.argtypes = [ctypes.c_void_p]
+    user32.RegisterClassW.restype = wintypes.ATOM
+    user32.CreateWindowExW.argtypes = [
+        wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+    user32.CreateWindowExW.restype = wintypes.HWND
+    user32.DestroyWindow.argtypes = [wintypes.HWND]
+    user32.DestroyWindow.restype = wintypes.BOOL
+    user32.LoadImageW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR,
+                                  wintypes.UINT, ctypes.c_int, ctypes.c_int,
+                                  wintypes.UINT]
+    user32.LoadImageW.restype = wintypes.HANDLE
+    user32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
+    user32.LoadIconW.restype = wintypes.HICON
+    user32.DestroyIcon.argtypes = [wintypes.HICON]
+    user32.DestroyIcon.restype = wintypes.BOOL
+    user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                                   wintypes.UINT, wintypes.UINT]
+    user32.GetMessageW.restype = wintypes.BOOL
+    user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.TranslateMessage.restype = wintypes.BOOL
+    user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.DispatchMessageW.restype = LRESULT
+
+    shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.c_void_p]
+    shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+
+    kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 
 def _tray_thread(poller):
-    global TRAY_OK
     try:
         import ctypes
         from ctypes import wintypes
-        user32 = ctypes.windll.user32
-        shell32 = ctypes.windll.shell32
-        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.WinDLL('user32', use_last_error=True)
+        shell32 = ctypes.WinDLL('shell32', use_last_error=True)
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        _win32_prototypes(user32, shell32, kernel32, wintypes)
 
         NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
         NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_INFO = 1, 2, 4, 16
@@ -446,11 +614,20 @@ def _tray_thread(poller):
         wc.lpfnWndProc = proc
         wc.hInstance = hinst
         wc.lpszClassName = 'ClaudeUsageTrayWnd'
+        ctypes.set_last_error(0)
         if not user32.RegisterClassW(ctypes.byref(wc)):
-            return
+            err = ctypes.get_last_error()
+            if err != 1410:            # ERROR_CLASS_ALREADY_EXISTS:热重载时会撞上
+                TRAY_STATE[0] = 'failed'
+                _diag('RegisterClassW 失败,lastError=%d,托盘未创建' % err)
+                return
+        ctypes.set_last_error(0)
         hWnd = user32.CreateWindowExW(0, 'ClaudeUsageTrayWnd', 'ClaudeUsageTray',
                                       0, 0, 0, 0, 0, None, None, hinst, None)
         if not hWnd:
+            TRAY_STATE[0] = 'failed'
+            _diag('CreateWindowExW 失败,lastError=%d,托盘未创建'
+                  % ctypes.get_last_error())
             return
 
         def load_icon(pct=None):
@@ -482,7 +659,10 @@ def _tray_thread(poller):
         nid.hIcon = load_icon(init_pct)
         nid.szTip = 'Claude 用量:等待数据…'
         if not shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid)):
+            TRAY_STATE[0] = 'failed'
+            _diag('Shell_NotifyIconW(NIM_ADD) 失败,托盘图标未创建')
             return
+        TRAY_STATE[0] = 'ok'
 
         state = {'last_pct': None, 'notified': 0, 'icon_pct': init_pct,
                  'hicon': nid.hIcon}
@@ -553,7 +733,6 @@ def _tray_thread(poller):
 
         # 先刷一次再进消息循环
         poll_once()
-        poller_done = threading.Event()
 
         def poller_loop():
             while True:
@@ -561,8 +740,7 @@ def _tray_thread(poller):
                 try:
                     poll_once()
                 except Exception:
-                    pass
-                poller_done.set()
+                    _diag('托盘轮询异常:' + NL + traceback.format_exc())
 
         threading.Thread(target=poller_loop, daemon=True).start()
 
@@ -571,13 +749,10 @@ def _tray_thread(poller):
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
         shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
-        TRAY_OK = True
+        TRAY_STATE[0] = 'stopped'
     except Exception:
-        try:
-            open(os.path.join(HERE, 'error.log'), 'a', encoding='utf-8').write(
-                time.strftime('%Y-%m-%d %H:%M:%S ') + traceback.format_exc())
-        except Exception:
-            pass
+        TRAY_STATE[0] = 'failed'
+        _diag('托盘线程异常退出:' + NL + traceback.format_exc())
 
 # ── MCP stdio(JSON-RPC,换行分隔)──────────────────────────────────────────
 TOOLS = [{
@@ -588,11 +763,7 @@ TOOLS = [{
 }]
 
 def usage_text():
-    rec = read_usage()
-    if rec:
-        save_cached(rec)
-    else:
-        rec = load_cached()
+    rec = read_usage()      # read_usage 内部已经 save_cached 过,这里不要再写一次
     if not rec:
         return ('还没有读到用量数据。请在 Claude 桌面版里发送一条消息,'
                 '然后再次调用本工具。')
@@ -615,12 +786,22 @@ def usage_text():
     if not lines:
         lines.append('本地缓存中暂时没有窗口用量数据。')
     lines.append('(来自 Claude 桌面版本地缓存,随每条新消息自动更新)')
+    if TRAY_STATE[0] == 'failed':
+        lines.append('(提示: 系统托盘组件未启动,详情见扩展目录下 error.log)')
     return '\n'.join(lines)
 
+_SCANNER = None
+_SCAN_LOCK = threading.Lock()
+
 def read_usage():
-    scanner = UsageScanner()
-    scanner.poll()
-    last = scanner.last
+    """模块级单例:UsageScanner 的增量状态存在实例上,每次 new 一个
+    就等于把 3.6MB 的 WAL 从头重解析一遍(实测 0.36s,毫无加速)。"""
+    global _SCANNER
+    with _SCAN_LOCK:
+        if _SCANNER is None:
+            _SCANNER = UsageScanner()
+        _SCANNER.poll()
+        last = _SCANNER.last
     if last:
         save_cached(last)
         return last
@@ -634,7 +815,7 @@ def handle(req):
             'protocolVersion': req.get('params', {}).get('protocolVersion',
                                                          '2024-11-05'),
             'capabilities': {'tools': {}},
-            'serverInfo': {'name': 'claude-usage-monitor', 'version': '1.1.0'},
+            'serverInfo': {'name': 'claude-usage-monitor', 'version': VERSION},
         }}
     if method.startswith('notifications/'):
         return None
